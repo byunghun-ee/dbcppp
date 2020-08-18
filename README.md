@@ -1,12 +1,14 @@
-# dbcppp (DBC C++ parser)
-A C++ DBC file parser based on `boost.spirit`. This library is designed for decdoing performance.
+[![Build Status](https://travis-ci.org/xR3b0rn/dbcppp.svg?branch=master)](https://travis-ci.org/xR3b0rn/dbcppp)
+# dbcppp
+A C/C++ DBC file parser based on `boost.spirit`. This library is designed for decoding performance.
 # Features
 * very fast decoding
 * verbose parser output in error case
-* DBC is editable through C++ interface exported from the library
-* read DBC file
-* decode functionality for ISO CAN frames (8 data bytes)
-* decode functionality for FD CAN frames (64 data bytes) (doesn't work properly yet)
+* DBC is editable through C/C++ interface exported from the library
+* read/write DBC file
+* decode functionality for frames of arbitrarily byte length
+* [cantools](https://github.com/eerimoq/cantools) like decoding
+* [KCD](https://github.com/julietkilo/kcd) file format support
 ## DBC data types
 ### Supported
 * version
@@ -29,18 +31,40 @@ A C++ DBC file parser based on `boost.spirit`. This library is designed for decd
 * sigtype_attr_list
 * signal_type_refs
 * signal_groups
-# Build and install
+# Getting started
+## Dependencies
+* boost
+* libxml2
+## Build & Install
 ```
+git clone https://github.com/xR3b0rn/dbcppp.git
+cd dbcppp
 mkdir build
 cd build
 cmake ..
-make -j6
+make -j
 make RunTests
 make install
 ```
-## Dependencies
-* boost
 # Usage example
+## Command line tool
+### dbc2
+```
+# generate C source from DBC/KCD
+dbcppp dbc2 --dbc=file.dbc --format=C
+# beauty or merge DBC/KCD
+dbcppp dbc2 --dbc=file1.dbc --dbc=file2.kcd --format=DBC
+# print DBC/KCD in human readable format
+dbcppp dbc2 --dbc=file1.dbc --dbc=file2.kcd --format=human
+```
+### decode
+[cantools](https://github.com/eerimoq/cantools) like decoding:
+```
+candump any | dbcppp decode --bus=vcan0,file1.dbc --bus=vcan1,file2.dbc
+```
+## Library
+* [Examples](https://github.com/xR3b0rn/dbcppp/tree/master/src/Examples)
+* `C++`
 ```C++
 #include <fstream>
 #include <dbcppp/Network.h>
@@ -51,45 +75,85 @@ int main()
     if (net)
     {
         can_frame frame;
-        canfd_frame fd_frame;
         while (1)
         {
             receive_can_frame_from_somewhere(&frame);
-            receive_canfd_frame_from_somewhere(&fd_frame);
-            auto& msg = net->getMessageById(frame.id);
-            std::cout << "Received message: " << msg->getName() << std::endl;
-            for (auto* signal : msg->getSignals())
+            const Message* msg = net->getMessageById(frame.id);
+            if (msg)
             {
-                // either this for standard CAN frames
-                double raw = signal->decode8(frame.data);
-                // or this for FD CAN frames
-                // double raw = signal->decode64(fd_frame.data);
-                std::cout << "\t" << signal->name << "=" << signal->raw_to_phys(raw) << std::endl;
+                std::cout << "Received message: " << msg->getName() << std::endl;
+                msg->forEachSignal(
+                    [&](const Signal& signal)
+                    {
+                        uint64_t raw = signal.decode(frame.data);
+                        std::cout << "\t" << signal.getName() << "=" << signal.rawToPhys(raw) << std::endl;
+                    });
             }
         }
     }
 }
-
+```
+* `C`
+```C
+#include <stdio.h>
+#include <dbcppp/CApi.h>
+int main()
+{
+    const dbcppp_Nework* net = dbcppp_NetworkLoadDBCFromFile("your_dbc.dbc");
+    if (net)
+    {
+        can_frame frame;
+        while (1)
+        {
+            receive_can_frame_from_somewhere(&frame);
+            const dbcppp_Message* msg = dbcppp_NetworkGetMessageById(net, frame.id);
+            if (msg)
+            {
+                printf("Received message: %s\n", dbcppp_MessageGetName(msg));
+                void print_signal_data(const dbcppp_Signal* sig, void* data)
+                {
+                    can_frame* frame = (can_frame*)data;
+                    uint64_t raw = dbcppp_SignalDecode(sig, frame->data);
+                    double phys = dbcppp_SignalRawToPhys(sig, raw);
+                    printf("\t%s=%f\n", dbcppp_SignalGetName(sig), phys);
+                }
+                dbcppp_MessageForEachSignal(msg, print_signal_data, &frame);
+            }
+        }
+    }
+}
 ```
 # Decode-function
-The signals decode function is using prestored masks and fixed offsets to speed up calculation, therefore the decoding-function should be almost as fast as a code generated decode function would be. The assembly of the `decode8` on its critical path (signed and byte swap must happen) looks similar to this:
+The signals decode function is using prestored masks and fixed offsets to speed up calculation, therefore the decoding-function should be almost as fast as a code generated decode function would be. The assembly of the `decode`-function on its critical path (signed and byte swap must happen) looks like this (VS19 10.0.18362.0 compiler):
 ```
-decode8(unsigned long, unsigned long, unsigned long, unsigned long):
-        bswap   rdi
-        shr     rdi, cl
-        pxor    xmm0, xmm0
-        and     rsi, rdi
-        mov     rax, rsi
-        or      rax, rdx
-        test    rsi, rdx
-        cmovne  rsi, rax
-        cvtsi2sd        xmm0, rsi
-        ret
+template <Alignment aAlignment, Signal::ByteOrder aByteOrder, Signal::ValueType aValueType, Signal::ExtendedValueType aExtendedValueType>
+double template_decode(const Signal* sig, const void* nbytes) noexcept
+00007FF8025BCA73  mov         rax,rcx  
+00007FF8025BCA76  mov         rcx,qword ptr [rcx+140h]  
+00007FF8025BCA7D  xorps       xmm0,xmm0  
+00007FF8025BCA80  bswap       r8  
+00007FF8025BCA83  shr         r8,cl  
+00007FF8025BCA86  and         r8,qword ptr [rax+130h]  
+00007FF8025BCA8D  mov         rcx,qword ptr [rax+138h]  
+00007FF8025BCA94  mov         rax,rcx  
+00007FF8025BCA97  or          rcx,r8  
+00007FF8025BCA9A  and         rax,r8  
+00007FF8025BCA9D  cmove       rcx,r8  
+00007FF8025BCAA1  cvtsi2sd    xmm0,rcx  
+00007FF8025BCAA6  ret   
 ```
-Assembly was generated using Compiler Explorer: https://godbolt.org/z/dHRqE4
+On the best path (no byteswap must take place and ExtendedValueType == Double) the decode function only has 5 instructions:
+```
+template <Alignment aAlignment, Signal::ByteOrder aByteOrder, Signal::ValueType aValueType, Signal::ExtendedValueType aExtendedValueType>
+double template_decode(const Signal* sig, const void* nbytes) noexcept
+00007FF8025BCAF0  mov         rax,qword ptr [rdx]  
+00007FF8025BCAF3  mov         qword ptr [rsp+8],rcx  
+00007FF8025BCAF8  mov         qword ptr [sig],rax  
+00007FF8025BCAFD  movsd       xmm0,mmword ptr [data]  
+00007FF8025BCB03  ret  
+```
 # Known issues
-* decode64 isn't working correctly on LittleEndian-maschine if the ValueType of the Signal is BigEndian
-* both decode functions weren't tested on a BigEndian-maschine
+* tests for decoding function for float/double is failing on some maschines (currently only confirmed for System/s390x)
 # Similar projects
   * [Vector_DBC](https://bitbucket.org/tobylorenz/vector_dbc/src/master/) Does basically the same, the biggest difference is that it uses `bison` instead of `boost::spirit` for grammar parsing
   * [CAN BUS tools in Python 3 (cantools)](https://github.com/eerimoq/cantools) 
